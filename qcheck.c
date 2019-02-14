@@ -6,9 +6,12 @@
  * Copyright 2005-2014 Mike Frysinger  - <vapier@gentoo.org>
  */
 
+#include "sys/xattr.h"
+#include "math.h"
+
 #ifdef APPLET_qcheck
 
-#define QCHECK_FLAGS "s:uABHTPp" COMMON_FLAGS
+#define QCHECK_FLAGS "s:uABHTmdxcPp" COMMON_FLAGS
 static struct option const qcheck_long_opts[] = {
 	{"skip",            a_argument, NULL, 's'},
 	{"update",         no_argument, NULL, 'u'},
@@ -16,6 +19,10 @@ static struct option const qcheck_long_opts[] = {
 	{"badonly",        no_argument, NULL, 'B'},
 	{"nohash",         no_argument, NULL, 'H'},
 	{"nomtime",        no_argument, NULL, 'T'},
+	{"nomode",         no_argument, NULL, 'm'},
+	{"nosha",          no_argument, NULL, 'd'},
+	{"nopax",          no_argument, NULL, 'x'},
+	{"nocaps",         no_argument, NULL, 'c'},
 	{"skip-protected", no_argument, NULL, 'P'},
 	{"prelink",        no_argument, NULL, 'p'},
 	COMMON_LONG_OPTS
@@ -27,6 +34,10 @@ static const char * const qcheck_opts_help[] = {
 	"Only print pkgs containing bad files",
 	"Ignore differing/unknown file chksums",
 	"Ignore differing file mtimes",
+	"Ignore differing file modes",
+	"Ignore differing file SHA digests",
+	"Ignore differing file attributes for pax markings",
+	"Ignore differing file attributes for POSIX capability",
 	"Ignore files in CONFIG_PROTECT-ed paths",
 	"Undo prelink when calculating checksums",
 	COMMON_OPTS_HELP
@@ -34,6 +45,10 @@ static const char * const qcheck_opts_help[] = {
 #define qcheck_usage(ret) usage(ret, QCHECK_FLAGS, qcheck_long_opts, qcheck_opts_help, NULL, lookup_applet_idx("qcheck"))
 
 #define qcprintf(fmt, args...) do { if (!state->bad_only) printf(_(fmt), ## args); } while (0)
+
+#define SHA1_DIGEST_LENGTH 40
+#define SHA256_DIGEST_LENGTH 64
+#define SHA512_DIGEST_LENGTH 128
 
 struct qcheck_opt_state {
 	array_t *atoms;
@@ -43,25 +58,102 @@ struct qcheck_opt_state {
 	bool chk_afk;
 	bool chk_hash;
 	bool chk_mtime;
+	bool chk_mode;
+	bool chk_sha_digests;
+	bool chk_attrs_pax;
+	bool chk_attrs_caps;
 	bool chk_config_protect;
 	bool undo_prelink;
 };
 
+/* Move to the right pos in fp_contents_caps, read chars, put into fentry_caps and return */
+static int get_recorded_meta(char *fentry_caps, FILE *fp_contents_caps, int entry_id, int record_len)
+{
+	int ret = 0;
+	int linelen = record_len + 1; /* including newline */
+	int bytes = linelen * (entry_id-1);
+	fseek(fp_contents_caps, bytes, SEEK_SET);
+
+	if (fgets(fentry_caps, linelen, fp_contents_caps) == NULL)
+		ret = 1;
+
+	return ret;
+}
+
+/* Get DIGEST from recorded CONTENTS_DIGESTS_* */
+static int cmp_recorded_digest(FILE * fp, int entry_id, char * fname, const char * hash_algo)
+{
+	int ret = 1;
+	int record_len = 0;
+
+	if (strcmp(hash_algo,"SHA1") == 0)
+		record_len = SHA1_DIGEST_LENGTH;
+	if (strcmp(hash_algo,"SHA256") == 0)
+		record_len = SHA256_DIGEST_LENGTH;
+	if (strcmp(hash_algo,"SHA512") == 0)
+		record_len = SHA512_DIGEST_LENGTH;
+
+	char * fentry_dig = xcalloc(record_len+1, sizeof(char));
+	char * file_digest = xcalloc(record_len+1, sizeof(char));
+
+	/* Get DIGEST from recorded CONTENTS_DIGESTS_* */
+	if (get_recorded_meta(fentry_dig, fp, entry_id, record_len) == 1) {
+		qcprintf("Error in CONTENTS_DIGESTS_%s, couldn't find entry: %s\n", hash_algo, fname);
+
+		free(fentry_dig);
+		free(file_digest);
+
+		return 1;
+	}
+
+	/* Get DIGEST from file using shasum */
+	external_check_sha(file_digest, fname, (char *)hash_algo);
+
+	/* See if digests match */
+	if (strcmp(fentry_dig, file_digest) != 0) {
+		qcprintf(" %s%s-DIGEST%s: %s", RED, hash_algo, NORM, fname);
+		if (verbose)
+			qcprintf(" ('%s' should be '%s')", file_digest, fentry_dig);
+		qcprintf("\n");
+	} else {
+		ret = 0;
+	}
+
+	free(fentry_dig);
+	free(file_digest);
+
+	return ret;
+}
+
 static int
 qcheck_process_contents(q_vdb_pkg_ctx *pkg_ctx, struct qcheck_opt_state *state)
 {
-	int fd_contents;
-	FILE *fp_contents, *fp_contents_update;
 	const char *catname = pkg_ctx->cat_ctx->name;
 	const char *pkgname = pkg_ctx->name;
+
+	int fd_contents;
+	FILE *fp_contents, *fp_contents_update, *fp_contents_modes, *fp_contents_attrs_pax, *fp_contents_attrs_caps;
 	size_t num_files, num_files_ok, num_files_unknown, num_files_ignored;
+	FILE *fp_contents_digests_sha1, *fp_contents_digests_sha256, *fp_contents_digests_sha512;
+
 	char *buffer, *line;
 	size_t linelen;
 	struct stat st, cst;
 	int cp_argc, cpm_argc;
 	char **cp_argv, **cpm_argv;
 
-	fp_contents_update = NULL;
+	int entry_id;
+	bool srch_dig;
+	int record_len;
+	int ret_cmp;
+
+	bool chk_mode = qcheck_state->chk_mode;
+	bool chk_sha_digests = qcheck_state->chk_sha_digests;
+	bool chk_attrs_pax = qcheck_state->chk_attrs_pax;
+	bool chk_attrs_caps = qcheck_state->chk_attrs_caps;
+
+	fp_contents = fp_contents_update = fp_contents_modes = fp_contents_attrs_pax = fp_contents_attrs_caps = NULL;
+	fp_contents_digests_sha1 = fp_contents_digests_sha256 = fp_contents_digests_sha512 = NULL;
 
 	/* Open contents */
 	fd_contents = q_vdb_pkg_openat(pkg_ctx, "CONTENTS", O_RDONLY|O_CLOEXEC, 0);
@@ -90,17 +182,104 @@ qcheck_process_contents(q_vdb_pkg_ctx *pkg_ctx, struct qcheck_opt_state *state)
 		}
 	}
 
+	/* Open contents_modes */
+	if (verbose)
+		qcprintf("%s%s/%s%s Opening modes-file\n",
+			RED, catname, pkgname, NORM);
+	fp_contents_modes = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_MODES");
+	if (chk_mode) {
+		/* Find failures */
+		if (fp_contents_modes == NULL) {
+			chk_mode = false;
+			if (verbose)
+				qcprintf("%s%s/%s%s No modes recorded, skipping modes check\n",
+					RED, catname, pkgname, NORM);
+		} else {
+			if (verbose)
+				qcprintf("%s%s/%s%s Found recorded modes, checking\n",
+					RED, catname, pkgname, NORM);
+		}
+	}
+
+	/* Open contents_digests_* */
+	if (verbose)
+		qcprintf("%s%s/%s%s Opening digests-files\n",
+			RED, catname, pkgname, NORM);
+	fp_contents_digests_sha1 = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_DIGESTS_SHA1");
+	fp_contents_digests_sha256 = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_DIGESTS_SHA256");
+	fp_contents_digests_sha512 = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_DIGESTS_SHA512");
+	if (chk_sha_digests) {
+		/* Find failures */
+		if (fp_contents_digests_sha1 == NULL && fp_contents_digests_sha256 == NULL && fp_contents_digests_sha512 == NULL) {
+			chk_sha_digests = false;
+			if (verbose)
+				qcprintf("%s%s/%s%s No sha-digests recorded, skipping digests checks\n",
+					RED, catname, pkgname, NORM);
+		} else {
+			if (verbose)
+				qcprintf("%s%s/%s%s Found recorded sha-digests, checking\n",
+					RED, catname, pkgname, NORM);
+		}
+	}
+
+	/* Open contents_attrs_pax */
+	if (verbose)
+		qcprintf("%s%s/%s%s Opening pax-file\n",
+			RED, catname, pkgname, NORM);
+	fp_contents_attrs_pax = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_ATTRS_PAX");
+	if (chk_attrs_pax) {
+		/* Find failures */
+		if (fp_contents_attrs_pax == NULL) {
+			chk_attrs_pax = false;
+			if (verbose)
+				qcprintf("%s%s/%s%s No pax-markings recorded, skipping pax check\n",
+					RED, catname, pkgname, NORM);
+		} else {
+			if (verbose)
+				qcprintf("%s%s/%s%s Found recorded pax-markings, checking\n",
+					RED, catname, pkgname, NORM);
+		}
+	}
+
+	/* Open contents_attrs_caps */
+	if (verbose)
+		qcprintf("%s%s/%s%s Opening caps-file\n",
+			RED, catname, pkgname, NORM);
+	fp_contents_attrs_caps = q_vdb_pkg_fopenat_ro(pkg_ctx, "CONTENTS_ATTRS_CAPS");
+	if (chk_attrs_caps) {
+		/* Find failures */
+		if (fp_contents_attrs_caps == NULL) {
+			chk_attrs_caps = false;
+			if (verbose)
+				qcprintf("%s%s/%s%s No caps recorded, skipping caps check\n",
+					RED, catname, pkgname, NORM);
+		} else {
+			if (verbose)
+				qcprintf("%s%s/%s%s Found recorded caps, checking\n",
+					RED, catname, pkgname, NORM);
+		}
+	}
+
 	if (!state->chk_config_protect) {
 		makeargv(config_protect, &cp_argc, &cp_argv);
 		makeargv(config_protect_mask, &cpm_argc, &cpm_argv);
 	}
 
+	entry_id = 0;
 	buffer = line = NULL;
 	while (getline(&line, &linelen, fp_contents) != -1) {
+		/* In this loop we perform several tests.
+		 * If a file fails a test, we do 'fail by continue'
+		 * If a file succeeds all tests, num_files_ok is incremented
+		 */
 		contents_entry *entry;
 		free(buffer);
 		buffer = xstrdup(line);
+		record_len = 0;
+		srch_dig = true;
+		ret_cmp = 0;
 
+		entry_id++;
 		entry = contents_parse_line(line);
 
 		if (!entry)
@@ -264,6 +443,171 @@ qcheck_process_contents(q_vdb_pkg_ctx *pkg_ctx, struct qcheck_opt_state *state)
 			continue;
 		}
 
+		/* Check mode, size 4+1 */
+		if (chk_mode) {
+			/* Get MODE from recorded CONTENTS_MODES */
+			record_len = 4;
+			char * fentry_mode = xcalloc(record_len+1, sizeof(char));
+
+			if (get_recorded_meta(fentry_mode, fp_contents_modes, entry_id, record_len) == 1) {
+				qcprintf("Error in CONTENTS_MODES, couldn't find entry: %s\n", entry->name);
+
+				free(fentry_mode);
+				continue;
+			}
+
+			/* We need a bigger buffer here, because filetype is part of stat_mode */
+			char f_mode[7];
+			snprintf(f_mode, 7, "%o", st.st_mode);
+
+			/* Ignore 2 trailing chars of f_mode, because filetype is part of stat_mode */
+			if (strcmp(f_mode+2, fentry_mode) != 0) {
+				qcprintf(" %sMODE%s: %s", RED, NORM, entry->name);
+				if (verbose)
+					qcprintf(" ('%s' should be '%s')", f_mode+2, fentry_mode);
+				qcprintf("\n");
+
+				free(fentry_mode);
+				continue;
+			}
+
+			free(fentry_mode);
+		}
+
+		/* Check digests */
+		if (chk_sha_digests && srch_dig && fp_contents_digests_sha1 != NULL) {
+			ret_cmp = cmp_recorded_digest(fp_contents_digests_sha1, entry_id, entry->name, "SHA1");
+			if (ret_cmp == 0) /* Success */
+				srch_dig = false; /* No need to try other digest types */
+			else if (ret_cmp == -1)
+				continue;
+		}
+		if (chk_sha_digests && srch_dig && fp_contents_digests_sha256 != NULL) {
+			ret_cmp = cmp_recorded_digest(fp_contents_digests_sha256, entry_id, entry->name, "SHA256");
+			if (ret_cmp == 0) /* Success */
+				srch_dig = false; /* No need to try other digest types */
+			else if (ret_cmp == -1)
+				continue;
+		}
+		if (chk_sha_digests && srch_dig && fp_contents_digests_sha512 != NULL) {
+			ret_cmp = cmp_recorded_digest(fp_contents_digests_sha512, entry_id, entry->name, "SHA512");
+			if (ret_cmp == 0) /* Success */
+				srch_dig = false; /* No need to try other digest types */
+			else if (ret_cmp == -1)
+				continue;
+		}
+
+		/* Check pax-markings, size 5+1 */
+		if (chk_attrs_pax) {
+			/* Get PAX from recorded CONTENTS_ATTRS_PAX */
+			record_len = 5;
+			char * fentry_pax = xcalloc(record_len+1, sizeof(char));
+
+			if (get_recorded_meta(fentry_pax, fp_contents_attrs_pax, entry_id, record_len) == 1) {
+				qcprintf("Error in CONTENTS_ATTRS_PAX, couldn't find entry: %s\n", entry->name);
+
+				free(fentry_pax);
+				continue;
+			}
+
+			size_t length = record_len;
+			char buf[6] = "";
+			char tmp1[6] = "0";
+			char tmp2[6] = "00";
+			char tmp3[6] = "000";
+			char tmp4[6] = "0000";
+			char f_pax[6] = "00000";
+
+			if(!(getxattr(entry->name, "user.pax.flags", buf, length) == -1)) {
+				int len = (int)strlen(buf);
+				if (len == record_len) {
+					strncpy(f_pax, buf, record_len);
+				} else if (len == 4) {
+					strncat(tmp1, buf, 5);
+					strncpy(f_pax, tmp1, record_len);
+				} else if (len == 3) {
+					strncat(tmp2, buf, 4);
+					strncpy(f_pax, tmp2, record_len);
+				} else if (len == 2) {
+					strncat(tmp3, buf, 3);
+					strncpy(f_pax, tmp3, record_len);
+				} else if (len == 1) {
+					strncat(tmp4, buf, 2);
+					strncpy(f_pax, tmp4, record_len);
+				}
+				f_pax[record_len] = '\0';
+			} else {
+				free(fentry_pax);
+				continue;
+			}
+
+			/* Compare record vs actual, and print messages if they differ */
+			if (strcmp(fentry_pax, f_pax) != 0) {
+				qcprintf(" %sPAX%s: %s", RED, NORM, entry->name);
+				if (verbose)
+					qcprintf(" ('%s' should be '%s')", f_pax, fentry_pax);
+				qcprintf("\n");
+			} else {
+				free(fentry_pax);
+				continue;
+			}
+
+			free(fentry_pax);
+		}
+
+		/* Check POSIX-capabilities, size 16+1 */
+		if (chk_attrs_caps) {
+			/* Get CAPS from recorded CONTENTS_ATTRS_CAPS */
+			record_len = 16;
+			char * fentry_caps = xcalloc(record_len+1, sizeof(char));
+
+			if (get_recorded_meta(fentry_caps, fp_contents_attrs_caps, entry_id, record_len) == 1)
+				qcprintf("Error in CONTENTS_ATTRS_PAX, couldn't find entry: %s\n", entry->name);
+				free(fentry_caps);
+				continue;
+			}
+
+			size_t length = 20;
+			unsigned char buf[20+1] = "";
+			char f_caps[16+1] = "0000000000000000";
+
+			/* Take the xattr value as string and process it */
+			if(!(getxattr(entry->name, "security.capability", buf, length) == -1)) {
+				long tmp = 0;
+				long res = 0;
+
+				/* Grab bytes 4 through 8 from xattr value */
+				for (int i = 4; i < 8; ++i) {
+					/* Convert those bytes to a long */
+					if (tmp == 0)
+						tmp = 1;
+					else
+						tmp = tmp*256;
+
+					res = res + (((int) buf[i]) * tmp);
+				}
+
+				/* Convert long from dec to 16-pos hex string */
+				snprintf(f_caps, record_len+1, "%016lx", res);
+			} else {
+				free(fentry_caps);
+				continue;
+			}
+
+			/* Compare record vs actual, and print messages if they differ */
+			if (strcmp(fentry_caps, f_caps) != 0) {
+				qcprintf(" %sCAPS%s: %s", RED, NORM, entry->name);
+				if (verbose)
+					qcprintf(" ('%s' should be '%s')", f_caps, fentry_caps);
+				qcprintf("\n");
+			} else {
+				free(fentry_caps);
+				continue;
+			}
+
+			free(fentry_caps);
+		}
+
 		/* Success! */
 		if (state->qc_update)
 			fputs(buffer, fp_contents_update);
@@ -272,7 +616,24 @@ qcheck_process_contents(q_vdb_pkg_ctx *pkg_ctx, struct qcheck_opt_state *state)
 	}
 	free(line);
 	free(buffer);
-	fclose(fp_contents);
+
+	if (chk_mode) {
+		fclose(fp_contents_modes);
+	}
+	if (chk_sha_digests) {
+		if (fp_contents_digests_sha1 != NULL)
+			fclose(fp_contents_digests_sha1);
+		if (fp_contents_digests_sha256 != NULL)
+			fclose(fp_contents_digests_sha256);
+		if (fp_contents_digests_sha512 != NULL)
+			fclose(fp_contents_digests_sha512);
+	}
+	if (chk_attrs_pax) {
+		fclose(fp_contents_attrs_pax);
+	}
+	if (chk_attrs_caps) {
+		fclose(fp_contents_attrs_caps);
+	}
 
 	if (!state->chk_config_protect) {
 		freeargv(cp_argc, cp_argv);
@@ -292,18 +653,26 @@ qcheck_process_contents(q_vdb_pkg_ctx *pkg_ctx, struct qcheck_opt_state *state)
 		if (!verbose)
 			return EXIT_SUCCESS;
 	}
+
+	if (fd_contents != -1)
+		close(fd_contents);
+	if (fp_contents != NULL)
+		fclose(fp_contents);
+	if (fp_contents_update != NULL)
+		fclose(fp_contents_update);
+
 	if (state->bad_only && num_files_ok != num_files) {
 		if (verbose)
-			printf("%s/%s\n", catname, pkgname);
+			printf("%s/%s:%s\n", catname, pkgname, pkg_ctx->slot);
 		else {
 			depend_atom *atom = NULL;
 			char *buf;
 			xasprintf(&buf, "%s/%s", catname, pkgname);
 			if ((atom = atom_explode(buf)) != NULL) {
-				printf("%s/%s\n", catname, atom->PN);
+				printf("%s/%s-%s\n", catname, atom->PN, atom->PV);
 				atom_implode(atom);
-			} else  {
-				printf("%s/%s\n", catname, pkgname);
+			} else {
+				printf("%s/%s:%s\n", catname, pkgname, pkg_ctx->slot);
 			}
 			free(buf);
 		}
